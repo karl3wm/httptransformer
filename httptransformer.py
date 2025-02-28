@@ -1,4 +1,4 @@
-import contextlib, inspect, json, os, psutil
+import contextlib, inspect, json, math, os, psutil
 import accelerate, huggingface_hub, requests, torch, tqdm, transformers
 
 class Quirks:
@@ -37,16 +37,26 @@ class Quirks:
 LAZY_TENSOR_TORCH_FUNCTIONS = {}
 class LazyTensor(torch.Tensor):
 
+    def __new__(cls, *params, **kwparams):
+        # workaround for accelerate bug w/ param_cls and custom tensors
+        requires_grad = kwparams.pop('requires_grad', None)
+        self = super().__new__(cls, *params, **kwparams)
+        if type(params[0]) is LazyTensor:
+            self._set(params[0])
+        if requires_grad is not None:
+            self.requires_grad_(requires_grad)
+        return self
+
     session = requests.Session()
 
     @classmethod
-    def from_json(cls, url, N, weight, data, device):
+    def from_json(cls, url, N, weight, data, device, dtype=None):
         start, end = data['data_offsets']
         start += N + 8
         end += N + 8 - 1
         result = cls.decode([
             weight, url, start, data['shape'], data['dtype'], device
-        ])
+        ], dtype)
         assert end - start + 1 == result.nbytes
         result = cls.decode(result.encode())
         return result
@@ -58,15 +68,15 @@ class LazyTensor(torch.Tensor):
         dtype = dtype.upper()
         return [self.name_, self.request.url, self.storage_offset(), list(self.shape), dtype, self.target_device.type]
     @classmethod
-    def decode(cls, data):
-        weight, url, storage_offset, shape, dtype, device = data
-        dtype = dtype.replace('F', 'float')
-        dtype = dtype.lower()
+    def decode(cls, data, dtype=None):
+        weight, url, storage_offset, shape, real_dtype, device = data
+        real_dtype = real_dtype.replace('F', 'float')
+        real_dtype = real_dtype.lower()
         try:
-            dtype = getattr(torch, dtype)
+            real_dtype = getattr(torch, real_dtype)
         except:
-            dtype = getattr(torch, dtype + 'fn')
-        tensor = cls(torch.empty(shape, dtype = dtype, device = 'meta'))
+            real_dtype = getattr(torch, real_dtype + 'fn')
+        tensor = cls(torch.empty(shape, dtype = real_dtype, device = 'meta'))
         tensor.set_(source = tensor.untyped_storage(), storage_offset = storage_offset, size = tensor.size())
         start = storage_offset
         end = storage_offset + tensor.nbytes - 1
@@ -75,33 +85,33 @@ class LazyTensor(torch.Tensor):
         tensor.name_ = weight
         tensor.request = request
         tensor.target_device = torch.device(device)
+        tensor.target_dtype = dtype or real_dtype
         return tensor
 
     def _set(self, other):
         self.name_ = other.name_
-        self.request = other.request
         self.target_device = other.target_device
+        self.target_dtype = other.target_dtype
+        if self.nbytes == other.nbytes:
+            self.request = other.request
+        else:
+            assert self.is_contiguous()
+            start = self.storage_offset()
+            size = self.nbytes
+            #for stride in self.stride():
+            #    size *= stride
+            end = start + size - 1
+            self.request = other.request.copy()
+            self.request.prepare_headers(dict(Range='bytes='+str(start)+'-'+str(end)))
         return self
 
-    def _adjust(self, other):
-        self.name_ = other.name_
-        self.target_device = other.target_device
-        assert self.is_contiguous()
-        start = self.storage_offset()
-        size = self.nbytes
-        #for stride in self.stride():
-        #    size *= stride
-        end = start + size - 1
-        self.request = other.request.copy()
-        self.request.prepare_headers(dict(Range='bytes='+str(start)+'-'+str(end)))
-        return self
-
-    def fits_in_memory(self):
-        return self.nbytes < psutil.virtual_memory().available / 2
+    def mem_usage_frac(self):
+        bytes_avail_cpu = psutil.virtual_memory().available / 2
+        return self.numel() * self.target_dtype.itemsize / bytes_avail_cpu
 
     def download(self):
         chunk_size = 1024*128
-        with tqdm.tqdm(desc=self.name_, leave=False, total=self.nbytes) as pbar:
+        with tqdm.tqdm(desc=self.name_, leave=False, total=self.nbytes, unit='B', unit_scale=True) as pbar:
             buffer = memoryview(bytearray(self.nbytes))
 
             with self.session.send(self.request, stream=True) as response:
@@ -116,7 +126,7 @@ class LazyTensor(torch.Tensor):
             dtype = self.dtype,
             count = self.numel(),
             requires_grad = False,
-        ).to(self.target_device).reshape(self.shape)
+        ).to(self.target_device, dtype=self.target_dtype).reshape(self.shape)
 
 
     # torch api implementations
@@ -144,7 +154,7 @@ class LazyTensor(torch.Tensor):
         assert device_or_dtype in [self.device, self.device.type, self.target_device, self.target_device.type, self.dtype] # stub
         return self
     def __getitem__(self, idcs):
-        return super().__getitem__(idcs)._adjust(self)
+        return super().__getitem__(idcs)._set(self)
 
     @__provides(torch.nn.functional.embedding)
     def __embedding(input, weight, *params, **kwparams):
@@ -154,6 +164,24 @@ class LazyTensor(torch.Tensor):
             for token in tokens
         ])
         return torch.nn.functional.embedding(dense_input, dense_embedding, *params, **kwparams)
+
+    @__provides(torch.nn.functional.linear)
+    def __linear(input, weight, bias=None):
+        assert type(weight) is LazyTensor and type(input) is not LazyTensor
+        assert bias is None
+        number_passes = math.ceil(weight.mem_usage_frac())
+        rows_at_once = math.ceil(weight.shape[0] / number_passes)
+        return torch.cat([
+            torch.matmul(
+                input,
+                weight[offset : offset+rows_at_once].download().T
+            )
+            for offset in range(
+                0,
+                weight.shape[0],
+                rows_at_once
+            )
+        ], dim=-1)
 
 
 
@@ -167,7 +195,7 @@ class LazyStateDict(dict):
 
     def __getitem__(self, weight):
         tensor = super().__getitem__(weight)
-        if tensor.fits_in_memory():
+        if tensor.mem_usage_frac() < 1:
             return tensor.download()
         else:
             return tensor
@@ -215,16 +243,16 @@ class LazyStateDict(dict):
             #    safetensors_index = json.load(response.raw)
             with open(safetensors_index_fn) as safetensors_index_fh:
                 safetensors_index = json.load(safetensors_index_fh)
-    
+
             print(safetensors_index['metadata'])
-    
+
             fn_by_weight = safetensors_index['weight_map']
-    
+
             urls = [lfs_base_url + fn for fn in set(fn_by_weight.values())]
 
             tensors = {}
-        
-            with open(cache_fn, 'w') as cache_fh, tqdm.tqdm(urls,desc='downloading tensor urls (rm cache if interrupted!)') as pbar:
+
+            with open(cache_fn, 'w') as cache_fh, tqdm.tqdm(urls,desc='downloading tensor urls (rm cache if interrupted!)', unit='url') as pbar:
               for url in pbar:
                 # we could potentially also check the git-lfs sha256 from the base url and merklify the data too, this would mean downloading it all
                 #[b'version https://git-lfs.github.com/spec/v1', b'oid sha256:e94d32e8649e1a5b03cc0a343c59ca5a6d80d03cd46161b482fd3bb2484adb7d', b'size 4302350824']
@@ -235,8 +263,9 @@ class LazyStateDict(dict):
                 for weight, data in header.items():
                     if weight == '__metadata__':
                         continue
-                    #tensor_request_by_name[weight] = cls.tensor_request_from_json(url, N, data)
                     tensor = LazyTensor.from_json(url, N, weight, data, device)
+                    if tensor.target_dtype.itemsize == 1 and tensor.target_dtype.is_floating_point:
+                        tensor.target_dtype = torch.float32
                     tensors[weight] = tensor
                     json.dump(tensor.encode(), cache_fh)
                     cache_fh.write('\n')
@@ -268,15 +297,32 @@ def construct(model_id, device, config_patches = {}, attr_patches = {}):
     model.eval()
     return transformers.pipeline('text-generation', model=model, config=config, tokenizer=tokenizer)
 
-with Quirks.fake_cuda_available(): # avoid FP8 assertions on cpu during placement testing
-    pipe = construct(
-        'deepseek-ai/DeepSeek-V3',
-        device = 'cpu',
-        config_patches = dict(
-            max_position_embeddings = 64, # drop ctx len from 163840 to 64
-        ),
-        attr_patches = dict(
-            _supports_cache_class = False, # might be a bug that this isn't in the model
-        ),
-    )
-pipe('Once upon a time,', streamer = transformers.TextStreamer(pipe.tokenizer))
+if __name__ == '__main__':
+    with Quirks.fake_cuda_available(): # avoid FP8 assertions on cpu during placement testing
+        pipe = construct(
+            'deepseek-ai/DeepSeek-V3',
+            device = 'cpu',
+            config_patches = dict(
+                max_position_embeddings = 64, # drop ctx len from 163840 to 64
+            ),
+            attr_patches = dict(
+                _supports_cache_class = False, # might be a bug that this isn't in the model
+            ),
+        )
+
+    ## the final lm_head multiplication is the largest calculation in the model
+    ## and it takes 20 minutes to reach it during normal evaluation
+    ## so this tries it at the start to test it
+    class TestHiddenStates:
+        fn = 'hidden_states.1x6x7168.bfloat16.mmap'
+        shape = [1,6,7168]
+        size = torch.empty(shape,device='meta').flatten().shape[0]
+        dtype = torch.bfloat16
+        if os.path.exists(fn):
+            tensor = torch.from_file(fn, size=size, dtype=dtype).view(shape)
+        else:
+            tensor = rand(size=shape, dtype=dtype)
+    logits = pipe.model.lm_head(TestHiddenStates.tensor)
+    logits = pipe.model.lm_head(TestHiddenStates.tensor)
+
+    pipe('Once upon a time,', streamer = transformers.TextStreamer(pipe.tokenizer))
