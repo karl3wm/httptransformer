@@ -66,10 +66,10 @@ class LazyTensor(torch.Tensor):
         dtype = dtype.replace('float', 'F')
         dtype = dtype.removesuffix('fn')
         dtype = dtype.upper()
-        return [self.name_, self.request.url, self.storage_offset(), list(self.shape), dtype, self.target_device.type]
+        return [self.name_, self.request.url, self.request_offset, list(self.shape), dtype, self.target_device.type]
     @classmethod
     def decode(cls, data, dtype=None):
-        weight, url, storage_offset, shape, real_dtype, device = data
+        weight, url, request_offset, shape, real_dtype, device = data
         real_dtype = real_dtype.replace('F', 'float')
         real_dtype = real_dtype.lower()
         try:
@@ -77,13 +77,13 @@ class LazyTensor(torch.Tensor):
         except:
             real_dtype = getattr(torch, real_dtype + 'fn')
         tensor = cls(torch.empty(shape, dtype = real_dtype, device = 'meta'))
-        tensor.set_(source = tensor.untyped_storage(), storage_offset = storage_offset, size = tensor.size())
-        start = storage_offset
-        end = storage_offset + tensor.nbytes - 1
+        start = request_offset
+        end = start + tensor.nbytes - 1
         request = requests.Request('GET', url, dict(Range='bytes='+str(start)+'-'+str(end)))
         request = request.prepare()
         tensor.name_ = weight
         tensor.request = request
+        tensor.request_offset = request_offset
         tensor.target_device = torch.device(device)
         tensor.target_dtype = dtype or real_dtype
         return tensor
@@ -92,11 +92,12 @@ class LazyTensor(torch.Tensor):
         self.name_ = other.name_
         self.target_device = other.target_device
         self.target_dtype = other.target_dtype
+        self.request_offset = other.request_offset
         if self.nbytes == other.nbytes:
             self.request = other.request
         else:
             assert self.is_contiguous()
-            start = self.storage_offset()
+            start = other.request_offset + self.storage_offset() * self.element_size()
             size = self.nbytes
             #for stride in self.stride():
             #    size *= stride
@@ -186,12 +187,12 @@ class LazyTensor(torch.Tensor):
 
 
 class LazyStateDict(dict):
-    def __init__(self, tensor_request_by_name, device):
-        super().__init__(tensor_request_by_name)
+    def __init__(self, tensor_dict, device):
+        super().__init__(tensor_dict)
         self.device = device
 
     def get_meta_tensor(self, weight):
-        return super().__getitem__(weight)[0]
+        return super().__getitem__(weight)
 
     def __getitem__(self, weight):
         tensor = super().__getitem__(weight)
@@ -214,18 +215,40 @@ class LazyStateDict(dict):
             for key, [tensor, _] in super().items()
         ], key = lambda keytensor: keytensor[1].nbytes)[1]
 
+    def tie(self, key1, key2):
+        if not super().__contains__(key1):
+            super().__setitem__(key1, super().__getitem__(key2))
+        elif not super().__contains__(key2):
+            super().__setitem__(key2, super().__getitem__(key1))
+        else:
+            raise KeyError('weights present for both ties')
+
     @classmethod
     def from_user_repo_branch(cls, user, repo, branch, device):
         base_url = f'https://huggingface.co/{user}/{repo}/raw/{branch}/'
         lfs_base_url = f'https://huggingface.co/{user}/{repo}/resolve/{branch}/'
 
-        safetensors_index_fn = huggingface_hub.hf_hub_download(user + '/' + repo, 'model.safetensors.index.json', revision=branch)
+        try:
+            safetensors_index_fn = huggingface_hub.hf_hub_download(user + '/' + repo, 'model.safetensors.index.json', revision=branch)
+            #safetensors_index_url = base_url + 'model.safetensors.index.json'
+            #print(safetensors_index_url)
+            #with requests.get(safetensors_index_url, stream=True) as response:
+            #    safetensors_index = json.load(response.raw)
+            with open(safetensors_index_fn) as safetensors_index_fh:
+                safetensors_index = json.load(safetensors_index_fh)
+
+            print(safetensors_index['metadata'])
+
+            safetensors_fns = set(safetensors_index['weight_map'].values())
+            cache_fn = safetensors_index_fn + '.httptransformer.json'
+        except:
+            safetensors_fns = ['model.safetensors']
+            cache_fn = None#safetensors_fn + '.httptransformer.json'
 
         tensors = {}
 
         #cache_fn = os.path.join(os.path.dirname(safetensors_index_fn), 'httptransformer.json')
-        cache_fn = safetensors_index_fn + '.httptransformer.json'
-        if os.path.exists(cache_fn):
+        if cache_fn is not None and os.path.exists(cache_fn):
             with open(cache_fn) as cache_fh, tqdm.tqdm(desc='cached tensor urls', unit='B', unit_scale=True) as pbar:
                 pbar.total = cache_fh.seek(0, os.SEEK_END)
                 cache_fh.seek(0, os.SEEK_SET)
@@ -237,22 +260,13 @@ class LazyStateDict(dict):
                     tensors[tensor.name_] = tensor
                     pbar.update(cache_fh.tell() - pbar.n)
         if len(tensors) == 0:
-            #safetensors_index_url = base_url + 'model.safetensors.index.json'
-            #print(safetensors_index_url)
-            #with requests.get(safetensors_index_url, stream=True) as response:
-            #    safetensors_index = json.load(response.raw)
-            with open(safetensors_index_fn) as safetensors_index_fh:
-                safetensors_index = json.load(safetensors_index_fh)
 
-            print(safetensors_index['metadata'])
-
-            fn_by_weight = safetensors_index['weight_map']
-
-            urls = [lfs_base_url + fn for fn in set(fn_by_weight.values())]
+            urls = [lfs_base_url + fn for fn in safetensors_fns]
 
             tensors = {}
 
-            with open(cache_fn, 'w') as cache_fh, tqdm.tqdm(urls,desc='downloading tensor urls (rm cache if interrupted!)', unit='url') as pbar:
+            cache_fh = open(cache_fn, 'w') if cache_fn is not None else None
+            with tqdm.tqdm(urls,desc='downloading tensor urls (rm cache if interrupted!)', unit='url') as pbar:
               for url in pbar:
                 # we could potentially also check the git-lfs sha256 from the base url and merklify the data too, this would mean downloading it all
                 #[b'version https://git-lfs.github.com/spec/v1', b'oid sha256:e94d32e8649e1a5b03cc0a343c59ca5a6d80d03cd46161b482fd3bb2484adb7d', b'size 4302350824']
@@ -264,11 +278,12 @@ class LazyStateDict(dict):
                     if weight == '__metadata__':
                         continue
                     tensor = LazyTensor.from_json(url, N, weight, data, device)
-                    if tensor.target_dtype.itemsize == 1 and tensor.target_dtype.is_floating_point:
-                        tensor.target_dtype = torch.float32
+                    #if tensor.target_dtype.itemsize == 1 and tensor.target_dtype.is_floating_point:
+                    #    tensor.target_dtype = torch.float32
                     tensors[weight] = tensor
-                    json.dump(tensor.encode(), cache_fh)
-                    cache_fh.write('\n')
+                    if cache_fh is not None:
+                        json.dump(tensor.encode(), cache_fh)
+                        cache_fh.write('\n')
 
         return cls(tensors, device)
 
@@ -285,10 +300,13 @@ def construct(model_id, device, config_patches = {}, attr_patches = {}):
 
     with accelerate.init_empty_weights(), transformers.modeling_utils.no_init_weights():
         model = transformers.AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+    model.tie_weights()
     for key, val in attr_patches.items():
         setattr(model, key, val)
 
     lazy_state_dict = LazyStateDict.from_user_repo_branch(user, repo, branch, device=device)
+    for tie1, tie2 in accelerate.utils.find_tied_parameters(model):
+        lazy_state_dict.tie(tie1, tie2)
 
     # misuse cpu offloading by providing lazy_state_dict
     model = accelerate.cpu_offload(model, device, state_dict = lazy_state_dict)
