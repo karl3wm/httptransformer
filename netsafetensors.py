@@ -2,8 +2,8 @@
 # this useful module is not presently used yet by httptransformer.py,
 # but functions as an independent safetensors-compatible interface to remote safetensors
 
-import json, os, psutil
-import torch, tqdm
+import json, math, os, psutil
+import torch, transformers, tqdm
 
 class RequestsFetcher:
     session = None
@@ -45,7 +45,7 @@ class CachedRequestsFetcher(RequestsFetcher):
             with open(self.fn, 'wb+') as fh:
                 fh.truncate(size)
             self.mmap = mmap.mmap(self.fd, size)
-        self.blksize = os.statvfs(self.fn).f_bsize
+        self.blksize = math.lcm(os.statvfs(self.fn).f_bsize, os.sysconf('SC_PAGESIZE'))
         assert self.size() == super().size()
 
         # measure usage
@@ -57,26 +57,52 @@ class CachedRequestsFetcher(RequestsFetcher):
             data_off = self._next_sparse(hole_off, os.SEEK_DATA)
 
     def read(self, offset, length):
-        next_hole = self._next_sparse(offset, os.SEEK_HOLE)
         tail = min(offset + length, len(self.mmap))
+        aligned_offset = (offset // self.blksize) * self.blksize
+        aligned_tail = (((tail - 1) // self.blksize) + 1) * self.blksize
+
+        next_hole = self._next_sparse(aligned_offset, os.SEEK_HOLE)
+
         if next_hole < tail:
             # data not cached
-            if self.sparse_usage + length > (psutil.disk_usage(self.fn).free + self.sparse_usage) * self.usage_frac:
+            if self.sparse_usage + aligned_tail - aligned_offset > (psutil.disk_usage(self.fn).free + self.sparse_usage) * self.usage_frac:
                 # no more disk space
                 if not self.warned_space:
                     import warnings
                     warnings.warn('Reached disk usage fraction. Fetching new data live from the web.', stacklevel=3)
                     type(self).warned_space = True
                 return super().read(offset, length)
+
+            hole_on_left = self._next_sparse(aligned_offset - 1, os.SEEK_HOLE) < aligned_offset
+
             next_data = self._next_sparse(next_hole, os.SEEK_DATA)
             while next_data < tail:
                 assert next_data - next_hole <= length
-                self.mmap[next_hole:next_data] = super().read(next_hole, next_data - next_hole)
+                length = next_data - next_hole
+                self.mmap[next_hole:next_data] = super().read(next_hole, length)
+                self.sparse_usage += length
                 next_hole = self._next_sparse(next_data, os.SEEK_HOLE)
                 next_data = self._next_sparse(next_hole, os.SEEK_DATA)
             if next_hole < tail:
-                aligned_tail = (((tail - 1) // self.blksize) + 1) * self.blksize
-                self.mmap[next_hole:aligned_tail] = super().read(next_hole, aligned_tail - next_hole)
+                length = aligned_tail - next_hole
+                self.mmap[next_hole:aligned_tail] = super().read(next_hole, length)
+                self.sparse_usage += length
+                # updated this while sleepy
+                # on docker vms i found the memory mapper filling extra blocks with 0s
+                # this new code tries to ensure data is correct when that happens
+                extra_0s_right = min(self._next_sparse(aligned_tail, os.SEEK_HOLE), next_data)
+                while extra_0s_right > aligned_tail:
+                    length = extra_0s_right - aligned_tail
+                    self.mmap[aligned_tail:extra_0s_right] = super().read(aligned_tail, length)
+                    self.sparse_usage += length
+                    extra_0s_right = min(self._next_sparse(aligned_tail, os.SEEK_HOLE), next_data)
+            if hole_on_left:
+                if self._next_sparse(aligned_offset - 1, os.SEEK_HOLE) >= aligned_offset:
+                    # the hole on the left disappeared
+                    # this could be resolved by walking holes on the left or storing auxiliary data regarding allocated regions
+                    # the former is space efficient and the latter time efficient; they could be combined as well
+                    os.unlink(self.fn)
+                    raise Exception("Your memory mapper is writing data below the cached region even when aligned to the pagesize and blocksize. The current code generates corrupt cached runs of 0s in this situation.")
         return self.mmap[offset:tail]
 
     def size(self):
@@ -139,12 +165,14 @@ class SafeTensors:
     def metadata(self):
         return self.__metadata__
 
-def from_hf_hub(repo_id, lfs_filename, revision='main', repo_type=None):
+def from_hf_hub(repo_id, lfs_filename = transformers.utils.SAFE_WEIGHTS_NAME, revision='main', repo_type=None):
     import huggingface_hub
-    try:
-        folder = os.path.dirname(huggingface_hub.hf_hub_download(repo_id, 'config.json', revision=revision, repo_type=repo_type))
-    except:
-        folder = os.path.dirname(huggingface_hub.hf_hub_download(repo_id, 'README.md', revision=revision, repo_type=repo_type))
+    for test_fn in ['README.md'] + [fn for fn in transformers.utils.__dict__.values() if type(fn) is str and fn.endswith('.json')]:
+        try:
+            folder = os.path.dirname(huggingface_hub.hf_hub_download(repo_id, test_fn, revision=revision, repo_type=repo_type))
+            break
+        except:
+            pass
     repo_path = {
             None: '',
             'model': '',
