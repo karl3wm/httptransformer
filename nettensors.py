@@ -29,8 +29,9 @@ class NetTensor(torch.Tensor):
         bytes_avail_cpu = psutil.virtual_memory().available * self.safeslice.statedict.usage_frac
         return self.numel() * self.dtype.itemsize / bytes_avail_cpu
 
-    def fetch(self, progress=''):
-        assert self.mem_usage_frac() < 1
+    def fetch(self, progress='', validate_usage=True):
+        if validate_usage:
+            assert self.mem_usage_frac() < 1
         count = self.numel()
         readsize = self.safeslice.tensor.element_size()
         readlength = count * readsize
@@ -81,7 +82,7 @@ class NetTensor(torch.Tensor):
     def F_embedding(input, weight, *params, **kwparams):
         tokens, dense_input = input.unique(sorted = False, return_inverse = True)
         dense_embedding = torch.stack([
-            weight[token].fetch()
+            weight[token].fetch(validate_usage=False)
             for token in tokens
         ])
         return torch.nn.functional.embedding(dense_input, dense_embedding, *params, **kwparams)
@@ -94,13 +95,13 @@ class NetTensor(torch.Tensor):
         name = weight.safeslice.name.rsplit('.',1)[0]
         number_passes = math.ceil(weight.mem_usage_frac())
         if number_passes == 1:
-            product = torch.matmul(input, weight.fetch(progress=name).T)
+            product = torch.matmul(input, weight.fetch(progress=name, validate_usage=False).T)
         else:
             rows_at_once = math.ceil(weight.shape[0] / number_passes)
             product = torch.cat([
                 torch.matmul(
                     input,
-                    weight[offset : offset+rows_at_once].fetch(progress=f'row{offset}-{offset+rows_at_once}/{weight.shape[0]}').T
+                    weight[offset : offset+rows_at_once].fetch(progress=f'row{offset}-{offset+rows_at_once}/{weight.shape[0]}', validate_usage=False).T
                 )
                 for offset in tqdm.tqdm(range(
                     0,
@@ -111,7 +112,7 @@ class NetTensor(torch.Tensor):
         if bias is None:
             return product
         else:
-            return product + bias.fetch(progress=bias.safeslice.name)
+            return product + bias.fetch(progress=bias.safeslice.name, validate_usage=False)
 
     @classmethod
     def __torch_function__(cls, func, types, params=[], kwparams={}):
