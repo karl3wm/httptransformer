@@ -46,21 +46,24 @@ class NetTensor(torch.Tensor):
         return type(self)(self.safeslice, self)
 
     def to(self, dtype_or_device, dtype_or_nonblocking = None, nonblocking = None):
-        if type(dtype_or_device) is torch.dtype:
-            dtype = dtype_or_device
-            if dtype != self.dtype:
-                self = type(self)(self.safeslice, super().to(dtype))
-        else:
+        device = None
+        if type(dtype_or_device) is not torch.dtype:
             device = torch.device(dtype_or_device)
-            if type(dtype_or_nonblocking) is torch.dtype:
-                dtype = dtype_or_nonblocking
-                if dtype != self.dtype or device != self.device:
-                    self = type(self)(self.safeslice, super().to(dtype))
-                    self.device = device
+            if device.type in [self.device.type, 'meta']:
+                device = None
+            dtype = dtype_or_nonblocking
+        else:
+            dtype = dtype_or_device
+
+        if device is not None:
+            if dtype is not None and dtype != self.dtype:
+                self = type(self)(self.safeslice, super().to(dtype))
             else:
-                if device.type not in [self.device.type, 'meta']:
-                    self = self.clone()
-                    self.device = device
+                self = self.clone()
+            self.device = device
+        elif dtype is not None and dtype != self.dtype:
+            self = type(self)(self.safeslice, super().to(dtype))
+
         return self
 
     def contiguous(self):
@@ -69,8 +72,6 @@ class NetTensor(torch.Tensor):
     @staticmethod
     def __provides(torch_func):
         return lambda func: __nettensor_torch_impls__.__setitem__(torch_func, func)
-    #def __default(torch_func):
-    #    __nettensor_torch_dflts__.add(torch_func)
     def __fetch(torch_func):
         __nettensor_torch_fetch__.add(torch_func)
 
@@ -89,14 +90,14 @@ class NetTensor(torch.Tensor):
     def F_linear(input, weight, bias=None):
         cls = NetTensor
         assert type(weight) is cls and type(input) is torch.Tensor
-        assert bias is None
+        assert bias is None or type(bias) is cls
         name = weight.safeslice.name.rsplit('.',1)[0]
         number_passes = math.ceil(weight.mem_usage_frac())
         if number_passes == 1:
-            return torch.matmul(input, weight.fetch(progress=name).T)
+            product = torch.matmul(input, weight.fetch(progress=name).T)
         else:
             rows_at_once = math.ceil(weight.shape[0] / number_passes)
-            return torch.cat([
+            product = torch.cat([
                 torch.matmul(
                     input,
                     weight[offset : offset+rows_at_once].fetch(progress=f'row{offset}-{offset+rows_at_once}/{weight.shape[0]}').T
@@ -107,6 +108,10 @@ class NetTensor(torch.Tensor):
                     rows_at_once
                 ), desc=name, unit='blk', leave=False)
             ], dim=-1)
+        if bias is None:
+            return product
+        else:
+            return product + bias.fetch(progress=bias.safeslice.name)
 
     @classmethod
     def __torch_function__(cls, func, types, params=[], kwparams={}):
@@ -145,6 +150,6 @@ class NetStateDict:
     def items(self):
         return ([k, self[k]] for k in self.safetensors.keys())
 
-def from_hf_hub(repo_id, lfs_filename = None, revision='main', repo_type=None, **kwparams):
-    return NetStateDict(netsafetensors.from_hf_hub(repo_id, lfs_filename, revision, repo_type, **kwparams))
+def from_hf_hub(repo_id, lfs_filename = None, revision='main', repo_type=None, disk_usage_frac = 0.75, mem_usage_frac = 0.5, **kwparams):
+    return NetStateDict(netsafetensors.from_hf_hub(repo_id, lfs_filename, revision, repo_type, usage_frac = disk_usage_frac, **kwparams), usage_frac = mem_usage_frac)
 

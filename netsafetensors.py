@@ -125,6 +125,7 @@ class CachedRequestsFetchers(RequestsFetchers):
 
                 hole_on_left = self._next_sparse(aligned_offset - 1, os.SEEK_HOLE) < aligned_offset
 
+                length = aligned_tail - aligned_offset
                 next_data = self._next_sparse(next_hole, os.SEEK_DATA)
                 while next_data < tail:
                     assert next_data - next_hole <= length
