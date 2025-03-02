@@ -39,7 +39,12 @@ class RequestsFetchers:
         def read(self, offset, length, progress:str=''):
             assert length > 0
             self.request.prepare_headers(dict(**self.fetchers._headers,Range=f'bytes={offset}-{offset+length-1}'))
-            response = self.session.send(self.request, stream=True)
+            while True:
+                try:
+                    response = self.session.send(self.request, stream=True)
+                    break
+                except requests.exceptions.ConnectionError as e:
+                    warnings.warn(e, stacklevel=5)
             buf = memoryview(bytearray(length))
             if progress:
                 with tqdm.tqdm(desc=progress, total=length, unit='B', unit_scale=True, unit_divisor=1024, leave=False) as pbar:
