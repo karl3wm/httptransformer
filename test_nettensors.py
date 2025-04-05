@@ -1,9 +1,12 @@
 import accelerate, torch, transformers
 import nettensors
 
-model_id, revision = 'meta-llama/Llama-3.1-405B', 'b906e4dc842aa489c962f9db26554dcfdde901fe'
+#model_id, revision = 'meta-llama/Llama-3.1-405B', 'b906e4dc842aa489c962f9db26554dcfdde901fe'
 #model_id, revision = 'Nexusflow/Athene-V2-Chat', '493f1bbd561a5a7e3d27c4081d4ee47508bf6831'
 #model_id, revision = 'meta-llama/Llama-3.2-1B', '4e20de362430cd3b72f300e6b0f18e50e7166e08'
+#model_id, revision = 'deepseek-ai/DeepSeek-V3', '86518964eaef84e3fdd98e9861759a1384f9c29d'; torch.cuda.is_available = lambda: True; torch.cuda.get_device_capability = lambda *params: [9,0]
+model_id, revision = 'allenai/Llama-3.1-Tulu-3-405B', 'eac9accdae0f6d693c79f55b4d6ad792966c47ae'
+config_patches = dict(max_position_embeddings = 64)
 
 import contextlib, functools
 class Quirks:
@@ -32,51 +35,60 @@ class Quirks:
                 yield
             finally:
                 [unwrap() for unwrap in unwraps]
+    try:
+        import torch._dynamo
+    except:
+        pass
 
-def construct(model_id, revision):
+def construct(model_id, revision, config_patches = {}):
     config = transformers.AutoConfig.from_pretrained(model_id, revision=revision, trust_remote_code=True)
+    for key, val in config_patches.items():
+        setattr(config, key, val)
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id, revision=revision, trust_remote_code=True)
     state_dict = nettensors.from_hf_hub(model_id, revision=revision, trust_sizes=True, mem_usage_frac=0.33, disk_usage_frac=0.95)
     with Quirks.init_empty_weights():
-        model = transformers.AutoModelForCausalLM.from_pretrained(None, config=config, state_dict=state_dict, device_map='cpu', torch_dtype=torch.float64)
+        model = transformers.AutoModelForCausalLM.from_pretrained(None, config=config, state_dict=state_dict, revision=revision, trust_remote_code=True, device_map='cpu', torch_dtype=torch.float64)
     return transformers.pipeline('text-generation', model=model, config=config, tokenizer=tokenizer)
 
 print(model_id, revision)
-pipe = construct(model_id, revision)
+pipe = construct(model_id, revision, config_patches = config_patches)
 
-check = nettensors.from_hf_hub('baffo32/llm_logits', repo_type='dataset', lfs_filename=f"{model_id.replace('/','_')}_{revision}.logits.safetensors")
-
-_nested = False
-_first_module = None
-def compare(module, inputs, output, local, stored):
-    distance = (local - stored).abs()
-    err = distance.sum() / stored.abs().sum()
-    if err > 1.0/8:
-        if module.weight.mem_usage_frac() < 1:
-            module.weight = torch.nn.Parameter(module.weight.fetch())
-        import pdb; pdb.set_trace()
-        'local and stored differ significantly'
-def hook(module, inputs, output):
-    global _nested, _first_module
-    if _nested:
-        return
-    if _first_module is None:
-        _first_module = module
-    elif _first_module is module:
-        _nested = True # no more comparison data, stop checking
-        return
-    _nested = True
-    name = modnames[module]
-    for idx, input in enumerate(inputs):
-        if type(input) is torch.Tensor:
-            cmp = check[f'{name}.input.{idx}'].fetch()
-            compare(module, inputs, output, input, cmp)
-    if type(output) is torch.Tensor:
-        cmp = check[f'{name}.output'].fetch()
-        compare(module, inputs, output, output, cmp)
+try:
+    check = nettensors.from_hf_hub('baffo32/llm_logits', repo_type='dataset', lfs_filename=f"{model_id.replace('/','_')}_{revision}.logits.DEDUPLICATED.safetensors")
+except:
+    print('Error trying to load logits from baffo23/llm_lgotis . Not comparing first pass.')
+else:
     _nested = False
-modnames = {mod:name for name,mod in pipe.model.named_modules()}
-[mod.register_forward_hook(hook) for mod in modnames]
+    _first_module = None
+    def compare(module, inputs, output, local, stored):
+        distance = (local - stored).abs()
+        err = distance.sum() / stored.abs().sum()
+        if err > 1.0/8:
+            if module.weight.mem_usage_frac() < 1:
+                module.weight = torch.nn.Parameter(module.weight.fetch())
+            import pdb; pdb.set_trace()
+            'local and stored differ significantly'
+    def hook(module, inputs, output):
+        global _nested, _first_module
+        if _nested:
+            return
+        if _first_module is None:
+            _first_module = module
+        elif _first_module is module:
+            _nested = True # no more comparison data, stop checking
+            return
+        _nested = True
+        name = modnames[module]
+        for idx, input in enumerate(inputs):
+            if type(input) is torch.Tensor:
+                cmp = check[f'{name}.input.{idx}'].fetch()
+                compare(module, inputs, output, input, cmp)
+        if type(output) is torch.Tensor:
+            cmp = check[f'{name}.output'].fetch()
+            compare(module, inputs, output, output, cmp)
+        _nested = False
+    modnames = {mod:name for name,mod in pipe.model.named_modules()}
+    [mod.register_forward_hook(hook) for mod in modnames]
 
 class Streamer(transformers.TextStreamer):
     def on_finalized_text(self, text, stream_end=False):
