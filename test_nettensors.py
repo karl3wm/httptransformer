@@ -81,7 +81,7 @@ pipe = construct(model_id, revision, config_patches = config_patches)
 try:
     check = nettensors.from_hf_hub('baffo32/llm_logits', repo_type='dataset', lfs_filename=f"{model_id.replace('/','_')}_{revision}.logits.DEDUPLICATED.safetensors")
 except:
-    print('Error trying to load logits from baffo23/llm_lgotis . Not comparing first pass.')
+    print('Error trying to load logits from baffo23/llm_logits . Not comparing first pass.')
 else:
     _nested = False
     _first_module = None
