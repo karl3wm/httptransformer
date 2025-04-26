@@ -98,6 +98,7 @@ class ResumeData:
                 assert stored_state[:2] == [name, index]
                 stored_state[2:] = [self.STATE_COMPLETED, output]
                 self.states[idx+1:] = []
+                self.next_index = idx + 1
                 if time.time() > self.timestamp + self.sync_seconds:
                     self._sync()
                 return stored_state[2:]
@@ -122,13 +123,3 @@ class ResumeData:
         self._sync()
         #del self.states
         return self.lock.__exit__(*params, **kwparams)
-
-# ideas for replacing modules within torch spec:
-#   - register_[module_]forward_pre_hook could change the module's behavior, and then another hook put it back after
-#   - manual replacement of forward function, might be similar
-#   - inspection of __call__ source to see default space clearly
-#       __call__ calls _call_impl which uses local variables like forward_call.
-#       _call_impl(self, *args, **kwargs)
-
-
-
