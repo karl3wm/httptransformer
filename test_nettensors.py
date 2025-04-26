@@ -1,5 +1,5 @@
 import accelerate, torch, transformers
-import nettensors
+import nettensors, resuming
 
 #model_id, revision = 'meta-llama/Llama-3.1-405B', 'b906e4dc842aa489c962f9db26554dcfdde901fe'
 #model_id, revision = 'Nexusflow/Athene-V2-Chat', '493f1bbd561a5a7e3d27c4081d4ee47508bf6831'
@@ -65,7 +65,7 @@ def construct(model_id, revision, config_patches = {}):
     for key, val in config_patches.items():
         setattr(config, key, val)
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id, revision=revision, trust_remote_code=True)
-    state_dict = nettensors.from_hf_hub(model_id, revision=revision, trust_sizes=True, mem_usage_frac=0.33, disk_usage_frac=0.95)
+    state_dict = nettensors.from_hf_hub(model_id, revision=revision, trust_sizes=True, mem_usage_frac=0.25, disk_usage_frac=0.95)
     with Quirks.init_empty_weights():
         model = transformers.AutoModelForCausalLM.from_pretrained(None, config=config, state_dict=state_dict, revision=revision, trust_remote_code=True, device_map='cpu', torch_dtype=torch.float64)
     return transformers.pipeline('text-generation', model=model, config=config, tokenizer=tokenizer)
@@ -119,4 +119,5 @@ class Streamer(transformers.TextStreamer):
     def on_finalized_text(self, text, stream_end=False):
         print(); print(text)
 
-pipe('Once upon a time,', streamer=Streamer(pipe.tokenizer))
+with resuming.Resumer(model_id.replace('/','--')+'.resume', pipe.model) as resumer:
+    pipe('Once upon a time,', streamer=Streamer(pipe.tokenizer))
