@@ -10,6 +10,7 @@
 import codecs, json, math, os, psutil
 import torch, transformers, tqdm
 
+import requests_toolbelt
 import requests, mmap
 
 class RequestsFetchers:
@@ -58,6 +59,56 @@ class RequestsFetchers:
             return buf.obj
         def size(self):
             return int(self.session.send(self.head_request).headers['Content-Length'])
+        def read_many(self, offset_lengths, progress:str=''):
+            assert not any([length == 0 for offset, length in offset_lengths])
+            sorted_offset_lengths = list(offset_lengths)
+            sorted_offset_lengths.sort()
+            assert sorted_offset_lengths == offset_lengths # must be ascending order
+            offset_lengthss = [offset_lengths]
+            responses = []
+            while len(offset_lengthss):
+                chunk = offset_lengthss.pop()
+                assert len(chunk)
+                self.request.prepare_headers(dict(**self.fetchers._headers,Range='bytes='+', '.join(f'{offset}-{offset+length-1}' for offset, length in chunk)))
+                while True:
+                    try:
+                        response = self.session.send(self.request, stream=True)
+                        if response.status_code // 100 == 4: # likely header too large
+                            offset_lengthss.append(chunk[len(chunk)//2:])
+                            chunk = chunk[:len(chunk)//2]
+                            self.request.prepare_headers(dict(**self.fetchers._headers,Range='bytes='+', '.join(f'{offset}-{offset+length-1}' for offset, length in chunk)))
+                            continue
+                        responses.append(response)
+                        break
+                    except requests.exceptions.ConnectionError as e:
+                        warnings.warn(e, stacklevel=5)
+            content_lengths = [int(response.headers['Content-Length']) for response in responses]
+            buf = memoryview(bytearray(max(content_lengths)))
+            result = []
+            if progress:
+                with tqdm.tqdm(desc=progress, total=sum(content_lengths), unit='B', unit_scale=True, unit_divisor=1024, leave=False) as pbar:
+                    for responseidx in range(len(responses)):
+                        response = responses[responseidx]
+                        offset = 0
+                        length = content_lengths[responseidx]
+                        while offset < length:
+                            readsize = response.raw._fp.readinto(buf[offset:offset+1024*256])
+                            assert readsize
+                            pbar.update(readsize)
+                            offset += readsize
+                        multipart = requests_toolbelt.MultipartDecoder(buf.obj[:offset], response.headers['Content-Type'])
+                        result.extend([part.content for part in multipart.parts])
+                    for idx in range(len(result)):
+                        assert len(result[idx]) == offset_lengths[idx][1]
+            else:
+                result = [
+                        part.content
+                        for response in responses
+                        for part in requests_toolbelt.MultipartDecoder.from_response(response).parts
+                ]
+                for idx in range(len(result)):
+                    assert len(result[idx]) == offset_lengths[idx][1]
+            return result
         def __str__(self):
             return self.request.url
 
@@ -98,6 +149,10 @@ class CachedRequestsFetchers(RequestsFetchers):
                 hole_off = self._next_sparse(data_off, os.SEEK_HOLE)
                 cls.sparse_usage += hole_off - data_off
                 data_off = self._next_sparse(hole_off, os.SEEK_DATA)
+
+#        def read(self, offset, length, progress:str=''):
+#            self._read(offset, length, tail, progress, super().read)
+#            return self.mmap[offset:tail]
 
         def read(self, offset, length, progress:str=''):
             tail = min(offset + length, len(self.mmap))
@@ -167,6 +222,133 @@ class CachedRequestsFetchers(RequestsFetchers):
 
         def size(self):
             return len(self.mmap)
+
+    # this is kind of different
+    # it needs testing and debugging and such
+    # the hole interface wasn't sufficiently abstracted to do this without many mistakes
+        def read_many(self, offset_lengths, progress):
+            sorted_offset_lengths = list(offset_lengths)
+            sorted_offset_lengths.sort()
+            assert sorted_offset_lengths == offset_lengths
+            fetches = []
+            placements = []
+            fetch_outputs = []
+            place_outputs = []
+            check_holes_on_left = []
+            results = [None] * len(offset_lengths)
+            min_hole = 0
+            for idx in range(len(offset_lengths)):
+                offset, length = offset_lengths[idx]
+                tail = min(offset + length, len(self.mmap))
+                aligned_offset = (offset // self.blksize) * self.blksize
+                aligned_tail = min(self.size(), (((tail - 1) // self.blksize) + 1) * self.blksize)
+
+                next_hole = self._next_sparse(max(aligned_offset, min_hole), os.SEEK_HOLE)
+
+                if next_hole < tail:
+                    # data not cached
+                    cls = type(self.fetchers)
+                    if cls.sparse_usage + aligned_tail - aligned_offset > (psutil.disk_usage(self.fn).free + cls.sparse_usage) * self.fetchers.usage_frac:
+                        # no more disk space
+                        if not cls.warned_space:
+                            import warnings
+                            warnings.warn(
+                                '\nCACHE FULL CACHE FULL' +
+                                '\nRequested=' +
+                                str(tqdm.tqdm.format_sizeof(aligned_tail - aligned_offset, 'B', 1024))
+                                + ' Cached=' +
+                                str(tqdm.tqdm.format_sizeof(cls.sparse_usage, 'B', 1024))
+                                + ' Free=' +
+                                str(tqdm.tqdm.format_sizeof(psutil.disk_usage(self.fn).free, 'B', 1024))
+                                + '\n' +
+                                os.path.dirname(self.fn)
+                                + '\nCACHE FULL CACHE FULL'
+                            , stacklevel=5)
+                            cls.warned_space = True
+                        fetch_outputs.append([len(fetches), idx])
+                        fetches.append([offset, length])
+                        continue
+                        #return super().read(offset, length, progress=progress)
+    
+                    hole_on_left = self._next_sparse(max(aligned_offset - 1, min_hole), os.SEEK_HOLE) < aligned_offset
+    
+                    length = aligned_tail - aligned_offset
+                    next_data = self._next_sparse(next_hole, os.SEEK_DATA)
+                    while next_data < tail:
+                        assert next_data - next_hole <= length
+                        length = next_data - next_hole
+                        placements.append([len(fetches), next_hole, next_data])
+                        fetches.append([next_hole, length])
+                        #self.mmap[next_hole:next_data] = super().read(next_hole, length, progress=progress)
+                        cls.sparse_usage += length
+                        next_hole = self._next_sparse(next_data, os.SEEK_HOLE)
+                        next_data = self._next_sparse(next_hole, os.SEEK_DATA)
+                    if next_hole < tail:
+                        length = aligned_tail - next_hole
+                        placements.append([len(fetches), next_hole, aligned_tail])
+                        fetches.append([next_hole, length])
+                        #self.mmap[next_hole:aligned_tail] = super().read(next_hole, length, progress=progress)
+                        cls.sparse_usage += length
+                        # updated this while sleepy
+                        # on docker vms i found the memory mapper filling extra blocks with 0s
+                        # this new code tries to ensure data is correct when that happens
+                        # i've also updated the pagesize calculation so this might happen less
+                        next_hole = self._next_sparse(aligned_tail, os.SEEK_HOLE)
+                        extra_0s_right = min(next_hole, next_data)
+                        while extra_0s_right > aligned_tail:
+                            length = extra_0s_right - aligned_tail
+                            placements.append([len(fetches), aligned_tail, extra_0s_right])
+                            fetches.append([aligned_tail, length])
+                            #self.mmap[aligned_tail:extra_0s_right] = super().read(aligned_tail, length, progress=progress)
+                            cls.sparse_usage += length
+                            next_hole = self._next_sparse(extra_0s_right, os.SEEK_HOLE)
+                            extra_0s_right = min(next_hole, next_data)
+                    min_hole = max(next_hole, min_hole)
+                    if hole_on_left:
+                        check_holes_on_left.append(aligned_offset)
+                    #    if self._next_sparse(aligned_offset - 1, os.SEEK_HOLE) >= aligned_offset:
+                place_outputs.append([offset, tail, idx])
+                #return self.mmap[offset:tail]
+            if len(fetches):
+                fetches = super().read_many(fetches, progress=progress)
+                for fetchidx, start, end in placements:
+                    self.mmap[start:end] = fetches[fetchidx]
+                for fetchidx, resultidx in fetch_outputs:
+                    results[resultidx] = fetches[fetchidx]
+            for start, end, resultidx in place_outputs:
+                results[resultidx] = self.mmap[offset:tail]
+            for check_hole in check_holes_on_left:
+                if self._next_sparse(check_hole - 1, os.SEEK_HOLE) >= check_hole:
+                     # a hole on the left disappeared
+                     # this could be resolved by walking holes on the left or storing auxiliary data regarding allocated regions
+                     # the former is space efficient and the latter time efficient; they could be combined as well
+                     os.unlink(self.fn)
+                     raise Exception(
+                         'Your memory mapper is writing data below the cached region ' +
+                         'even when aligned to the pagesize and blocksize. ' +
+                         'The current code generates corrupt cached runs of 0s in this situation.')
+            return results
+
+#        def read_many(self, offsets_lengths, progress:str=''):
+#            outputs = [None] * len(offsets_lengths)
+#            idcs = []
+#            offset_lengths = []
+#            def append(offset, length, progress)
+#                offset_lengths.append([offset, length])
+#                idcs.append(idx)
+#            for idx in range(len(offsets_lengths)):
+#                offset, length = offsets_lengths[idx]
+#                tail = min(offset + length, len(self.mmap))
+#                self._read(offset, length, tail, progress, append):
+#            if len(offset_lengths):
+#                datas = super().read_many(offset_lengths, progress=progress)
+#                for idxidx in range(len(datas)):
+#                    outputs
+#
+#        def read(self, offset, length, progress:str=''):
+#            tail = min(offset + length, len(self.mmap))
+#            self._read(offset, length, tail, progress, super().read)
+#            return self.mmap[offset:tail]
 
         def _next_sparse(self, off, region):
             try:
