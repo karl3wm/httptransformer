@@ -441,11 +441,11 @@ class SafeTensorsIndex:
             self.__tensors__[name] = safetensors
         return safetensors
 
-def _hf_cache_lfs_fetchers(repo_id, revision, repo_type, **kwparams):
+def _hf_cache_lfs_fetchers(repo_id, revision, repo_type, subfolder=None, **kwparams):
     import huggingface_hub
     for test_fn in ['README.md'] + [fn for fn in transformers.utils.__dict__.values() if type(fn) is str and fn.endswith('.json')]:
         try:
-            folder = os.path.dirname(huggingface_hub.hf_hub_download(repo_id, test_fn, revision=revision, repo_type=repo_type))
+            folder = os.path.dirname(huggingface_hub.hf_hub_download(repo_id, test_fn, revision=revision, repo_type=repo_type, subfolder=subfolder))
             break
         except:
             pass
@@ -455,6 +455,8 @@ def _hf_cache_lfs_fetchers(repo_id, revision, repo_type, **kwparams):
             'dataset': 'datasets/',
             'space': 'spaces/'
     }[repo_type] + repo_id
+    if subfolder is not None:
+        revision += '/' + subfolder
     return CachedRequestsFetchers(
         os.path.join(folder, 'netsafetensors'),
         f'https://huggingface.co/{repo_path}/resolve/{revision}',

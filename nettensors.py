@@ -151,6 +151,6 @@ class NetStateDict:
     def items(self):
         return ([k, self[k]] for k in self.safetensors.keys())
 
-def from_hf_hub(repo_id, lfs_filename = None, revision='main', repo_type=None, disk_usage_frac = 0.75, mem_usage_frac = 0.5, **kwparams):
-    return NetStateDict(netsafetensors.from_hf_hub(repo_id, lfs_filename, revision, repo_type, usage_frac = disk_usage_frac, **kwparams), usage_frac = mem_usage_frac)
+def from_hf_hub(repo_id, lfs_filename = None, revision='main', repo_type=None, subfolder = None, disk_usage_frac = 0.75, mem_usage_frac = 0.5, **kwparams):
+    return NetStateDict(netsafetensors.from_hf_hub(repo_id, lfs_filename, revision, repo_type, subfolder = subfolder, usage_frac = disk_usage_frac, **kwparams), usage_frac = mem_usage_frac)
 
