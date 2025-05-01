@@ -18,7 +18,8 @@ def diffusers_ModelMixin_from_pretrained(cls, name, torch_dtype=None, low_cpu_me
         hf_q = None
     with accelerate.init_empty_weights():
         model = cls.from_config(config, low_cpu_mem_usage=low_cpu_mem_usage)
-    state_dict = nettensors.from_hf_hub(name, lfs_filename='diffusion_pytorch_model.safetensors', **nettensors_kwparams)
+    #state_dict = nettensors.from_hf_hub(name, lfs_filename='diffusion_pytorch_model.safetensors', **nettensors_kwparams)
+    state_dict = nettensors.from_hf_hub(name, **nettensors_kwparams)
     model._convert_deprecated_attention_blocks(state_dict)
     diffusers.models.modeling_utils.load_model_dict_into_meta(model, state_dict, device='cpu', dtype=torch_dtype, model_name_or_path=name, hf_quantizer=hf_q)
     if hf_q is not None:
@@ -28,7 +29,7 @@ def diffusers_ModelMixin_from_pretrained(cls, name, torch_dtype=None, low_cpu_me
     model.eval()
     return model
 
-_transformers_PreTrainedModel_from_pretrained = transformers.PreTrainedModel.from_pretrained
+_transformers_PreTrainedModel_from_pretrained = transformers.PreTrainedModel.from_pretrained.__func__
 @classmethod
 def transformers_PreTrainedModel_from_pretrained(cls, model_id, revision=None, config_patches = {}, subfolder=None, **kwparams):
     config = transformers.AutoConfig.from_pretrained(model_id, revision=revision, trust_remote_code=True, subfolder=subfolder)
@@ -39,7 +40,7 @@ def transformers_PreTrainedModel_from_pretrained(cls, model_id, revision=None, c
         model = _transformers_PreTrainedModel_from_pretrained(cls, None, config=config, state_dict=state_dict, revision=revision, **kwparams)
     return model
 
-_diffusers_DiffusionPipeline_from_pretrained = diffusers.DiffusionPipeline.from_pretrained
+_diffusers_DiffusionPipeline_from_pretrained = diffusers.DiffusionPipeline.from_pretrained.__func__
 @classmethod
 def diffusers_DiffusionPipeline_from_pretrained(cls, name, torch_dtype=None,provider=None,sess_options=None,device_map=None,max_memory=None,offload_folder=None,offload_state_dict=False,from_flax=False,variant=None,low_cpu_mem_usage=diffusers.models.modeling_utils._LOW_CPU_MEM_USAGE_DEFAULT,use_safetensors=None,**kwparams):
     cache_dir = huggingface_hub.snapshot_download(name, allow_patterns=[])

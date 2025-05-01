@@ -10,6 +10,24 @@
 import codecs, json, math, os, psutil
 import torch, transformers, tqdm
 
+SAFE_WEIGHTS_NAMES = []
+SAFE_WEIGHTS_INDEX_NAMES = []
+_TEST_FNS = ['README.md']
+try:
+    import transformers
+    _TEST_FNS.extend([fn for fn in transformers.utils.__dict__.values() if type(fn) is str and fn.endswith('.json')])
+    SAFE_WEIGHTS_NAMES.append(transformers.utils.SAFE_WEIGHTS_NAME)
+    SAFE_WEIGHTS_INDEX_NAMES.append(transformers.utils.SAFE_WEIGHTS_INDEX_NAME)
+except ImportError:
+    pass
+try:
+    import diffusers
+    _TEST_FNS.extend([fn for fn in diffusers.utils.__dict__.values() if type(fn) is str and fn.endswith('.json')])
+    SAFE_WEIGHTS_NAMES.append(diffusers.utils.SAFETENSORS_WEIGHTS_NAME)
+    SAFE_WEIGHTS_INDEX_NAMES.append(diffusers.utils.SAFE_WEIGHTS_INDEX_NAME)
+except ImportError:
+    pass
+
 import requests_toolbelt
 import requests, mmap
 
@@ -415,7 +433,7 @@ class SafeTensors:
         return self.__metadata__
 
 class SafeTensorsIndex:
-    def __init__(self, fetchers, filename = transformers.utils.SAFE_WEIGHTS_INDEX_NAME):
+    def __init__(self, fetchers, filename = SAFE_WEIGHTS_INDEX_NAMES[0]):
         if type(fetchers) is str:
             fetchers = RequestsFetchers(fetchers)
         self.fetchers = fetchers
@@ -443,7 +461,7 @@ class SafeTensorsIndex:
 
 def _hf_cache_lfs_fetchers(repo_id, revision, repo_type, subfolder=None, **kwparams):
     import huggingface_hub
-    for test_fn in ['README.md'] + [fn for fn in transformers.utils.__dict__.values() if type(fn) is str and fn.endswith('.json')]:
+    for test_fn in _TEST_FNS:
         try:
             folder = os.path.dirname(huggingface_hub.hf_hub_download(repo_id, test_fn, revision=revision, repo_type=repo_type, subfolder=subfolder))
             break
@@ -467,23 +485,30 @@ def _hf_cache_lfs_fetchers(repo_id, revision, repo_type, subfolder=None, **kwpar
 def from_hf_hub(repo_id, lfs_filename = None, revision='main', repo_type=None, **kwparams):
     fetchers = _hf_cache_lfs_fetchers(repo_id, revision, repo_type, **kwparams)
     if lfs_filename is not None:
-        if lfs_filename == transformers.utils.SAFE_WEIGHTS_NAME:
+        if lfs_filename in SAFE_WEIGHTS_NAMES:
             return SafeTensors(fetchers.fetcher(lfs_filename))
-        elif lfs_filename == transformers.utils.SAFE_WEIGHTS_INDEX_NAME:
+        elif lfs_filename in SAFE_WEIGHTS_INDEX_NAMES:
             return SafeTensorsIndex(fetchers, lfs_filename)
         else:
             try:
                 return SafeTensors(fetchers.fetcher(lfs_filename))
             except AssertionError:
-                return SafeTensorsIndex(fetchers, lfs_filename)
+                try:
+                    return SafeTensorsIndex(fetchers, lfs_filename)
+                except AssertionError:
+                    return SafeTensorsIndex(fetchers, lfs_filename + '.index.json')
     else:
-        try:
-            return SafeTensors(
-                fetchers.fetcher(transformers.utils.SAFE_WEIGHTS_NAME)
-            )
-        except AssertionError:
-            return SafeTensorsIndex(fetchers, transformers.utils.SAFE_WEIGHTS_INDEX_NAME)
-
+        for lfs_filename in SAFE_WEIGHTS_NAMES:
+            try:
+                return SafeTensors(fetchers.fetcher(lfs_filename))
+            except AssertionError as e:
+                err = e
+        for lfs_filename in SAFE_WEIGHTS_INDEX_NAMES:
+            try:
+                return SafeTensorsIndex(fetchers, lfs_filename)
+            except AssertionError as e:
+                err = e
+        raise err
 
 if __name__ == '__main__':
     safetensors = from_hf_hub('deepseek-ai/DeepSeek-V3')
