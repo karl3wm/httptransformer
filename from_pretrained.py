@@ -1,5 +1,5 @@
 import contextlib
-import huggingface_hub, diffusers, transformers, accelerate
+import huggingface_hub, diffusers, transformers, accelerate, sentencepiece
 import torch
 import nettensors
 

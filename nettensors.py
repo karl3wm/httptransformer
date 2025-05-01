@@ -9,21 +9,28 @@ import psutil, torch, tqdm
 __nettensor_torch_impls__={}
 __nettensor_torch_fetch__=set()
 # choice of subclassing rather than composing Tensor so that uses of isinstance() succeed
+# note: how to correctly make a Tensor subclass has likely changed since this class was written.
 class NetTensor(torch.Tensor):
     # NetTensor is a 'meta' tensor but fakes its device
     device = torch.device('cpu')
 
-    # the code might simplify if the constructor signature were made to match the assumptions of torch's _convert function
-    def __new__(cls, safeslice, tensor = None):
+    # torch's _convert function makes certain assumptions, this ideally moves toward them
+    # later code can be simplified as this function has become more general
+    # torch.nn.Parameter as well as accelerate.big_modeling make things become easier if constructor params for Parameter can be passed here
+    def __new__(cls, tensor = None, *, safeslice, _is_param=False, **kwparams):
         if tensor is None:
             tensor = safeslice.tensor
-        self = super().__new__(cls, tensor)
+        if _is_param:
+            assert tensor._is_param
+            self = torch.nn.Parameter.__new__(cls, tensor, **kwparams)
+        else:
+            self = super().__new__(cls, tensor, **kwparams)
         self.safeslice = safeslice
         return self
 
     def __getitem__(self, slice):
         subtensor = super().__getitem__(slice)
-        return type(self)(self.safeslice, subtensor)
+        return type(self)(subtensor, safeslice=self.safeslice)
 
     def mem_usage_frac(self):
         bytes_avail_cpu = psutil.virtual_memory().available * self.safeslice.statedict.usage_frac
@@ -58,12 +65,12 @@ class NetTensor(torch.Tensor):
 
         if device is not None:
             if dtype is not None and dtype != self.dtype:
-                self = type(self)(self.safeslice, super().to(dtype))
+                self = type(self)(super().to(dtype), safeslice=self.safeslice)
             else:
                 self = self.clone()
             self.device = device
         elif dtype is not None and dtype != self.dtype:
-            self = type(self)(self.safeslice, super().to(dtype))
+            self = type(self)(super().to(dtype), safeslice=self.safeslice)
 
         return self
 
@@ -127,7 +134,7 @@ class NetTensor(torch.Tensor):
             else:
                 result = torch.Tensor.__torch_function__(func, [], params, kwparams)
                 if type(result) is torch.Tensor:
-                    result = cls(params[0].safeslice, result)
+                    result = cls(result, safeslice=params[0].safeslice)
             return result
         else:
             return handle(*params, **kwparams)
@@ -143,7 +150,7 @@ class NetStateDict:
         safeslice = self.safetensors.get_slice(item)
         safeslice.statedict = self
         safeslice.name = item
-        return NetTensor(safeslice)
+        return NetTensor(safeslice=safeslice)
     def __iter__(self):
         return iter(self.keys())
     def values(self):
