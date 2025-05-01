@@ -6,7 +6,7 @@ import nettensors
 nettensors_kwparams = dict(trust_sizes=True, mem_usage_frac=0.25, disk_usage_frac=0.95)
 
 @classmethod
-def diffusers_ModelMixin_from_pretrained(cls, name, torch_dtype=None, low_cpu_mem_usage=None, device_map=None, subfolder='', max_memory=None, offload_folder=None):
+def diffusers_ModelMixin_from_pretrained(cls, name, torch_dtype=None, low_cpu_mem_usage=None, device_map=None, subfolder='', max_memory=None, offload_folder=None, offload_state_dict=False, use_safetensors=None):
     config = cls.load_config(name, subfolder=subfolder)
     pq = config.get('quantization_config')
     if pq is not None:
@@ -35,7 +35,7 @@ def transformers_PreTrainedModel_from_pretrained(cls, model_id, revision=None, c
     for key, val in config_patches.items():
         setattr(config, key, val)
     state_dict = nettensors.from_hf_hub(model_id, revision=revision or 'main', subfolder=subfolder, **nettensors_kwparams)
-    with transformers.modeling_utils.no_init_weights, accelerate.init_empty_weights():
+    with transformers.modeling_utils.no_init_weights(), accelerate.init_empty_weights():
         model = _transformers_PreTrainedModel_from_pretrained(cls, None, config=config, state_dict=state_dict, revision=revision, **kwparams)
     return model
 
