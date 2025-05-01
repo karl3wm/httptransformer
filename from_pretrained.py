@@ -19,7 +19,7 @@ def diffusers_ModelMixin_from_pretrained(cls, name, torch_dtype=None, low_cpu_me
     with accelerate.init_empty_weights():
         model = cls.from_config(config, low_cpu_mem_usage=low_cpu_mem_usage)
     #state_dict = nettensors.from_hf_hub(name, lfs_filename='diffusion_pytorch_model.safetensors', **nettensors_kwparams)
-    state_dict = nettensors.from_hf_hub(name, **nettensors_kwparams)
+    state_dict = nettensors.from_hf_hub(name, subfolder=subfolder, **nettensors_kwparams)
     model._convert_deprecated_attention_blocks(state_dict)
     diffusers.models.modeling_utils.load_model_dict_into_meta(model, state_dict, device='cpu', dtype=torch_dtype, model_name_or_path=name, hf_quantizer=hf_q)
     if hf_q is not None:
@@ -50,7 +50,7 @@ def diffusers_DiffusionPipeline_from_pretrained(cls, name, torch_dtype=None,prov
     expected_modules, optional_kwargs = cls._get_signature_keys(pipeline_class)
     init_dict, *_ = pipeline_class.extract_init_dict(config)
     sub_models = {}
-    for sub_name, [library_name, class_name] in init_dict.items():
+    for sub_name, [library_name, class_name] in sorted(init_dict.items()):
         importable_classes = diffusers.pipelines.pipeline_utils.ALL_IMPORTABLE_CLASSES
         is_pipeline_module = hasattr(diffusers.pipelines, library_name)
         class_obj, class_candidates = diffusers.pipelines.pipeline_loading_utils.get_class_obj_and_candidates(
@@ -98,7 +98,7 @@ def nettensors_from_pretrained(**kwparams):
             for clsname in diffusers.pipelines.pipeline_utils.LOADABLE_CLASSES[pkgname]:
                 f = globals().get(f'{pkgname}_{clsname}_from_pretrained')
                 if f is None:
-                    if 'Pipeline' in clsname or 'Tokenizer' in clsname:
+                    if 'Pipeline' in clsname or 'Tokenizer' in clsname or 'Scheduler' in clsname:
                         continue
                     f = stub_from_pretrained
                 cls = getattr(pkg, clsname)

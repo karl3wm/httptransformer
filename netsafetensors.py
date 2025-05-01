@@ -492,21 +492,21 @@ def from_hf_hub(repo_id, lfs_filename = None, revision='main', repo_type=None, *
         else:
             try:
                 return SafeTensors(fetchers.fetcher(lfs_filename))
-            except AssertionError:
+            except (AssertionError, json.JSONDecodeError):
                 try:
                     return SafeTensorsIndex(fetchers, lfs_filename)
-                except AssertionError:
+                except (AssertionError, json.JSONDecodeError):
                     return SafeTensorsIndex(fetchers, lfs_filename + '.index.json')
     else:
         for lfs_filename in SAFE_WEIGHTS_NAMES:
             try:
                 return SafeTensors(fetchers.fetcher(lfs_filename))
-            except AssertionError as e:
+            except (AssertionError, json.JSONDecodeError) as e:
                 err = e
         for lfs_filename in SAFE_WEIGHTS_INDEX_NAMES:
             try:
                 return SafeTensorsIndex(fetchers, lfs_filename)
-            except AssertionError as e:
+            except (AssertionError, json.JSONDecodeError) as e:
                 err = e
         raise err
 
