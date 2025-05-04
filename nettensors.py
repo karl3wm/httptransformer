@@ -84,6 +84,9 @@ class NetTensor(torch.Tensor):
         __nettensor_torch_fetch__.add(torch_func)
 
     __fetch(torch.Tensor.mul)
+    def __rmul__(y, x): return x * y.fetch()
+    __fetch(torch.Tensor.add)
+    def __radd__(y, x): return x + y.fetch()
 
     @__provides(torch.nn.functional.embedding)
     def F_embedding(input, weight, *params, **kwparams):
@@ -120,6 +123,15 @@ class NetTensor(torch.Tensor):
             return product
         else:
             return product + bias.fetch(progress=bias.safeslice.name, validate_usage=False)
+
+    @__provides(torch.nn.functional.layer_norm)
+    def F_layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
+        if weight is not None:
+            weight = weight.fetch()
+        if bias is not None:
+            bias = bias.fetch()
+        #return torch.nn.functional.layer_norm(input, normalized_shape, weight, bias, eps)
+        return torch.layer_norm(input, normalized_shape, weight, bias, eps, torch.backends.cudnn.enabled)
 
     @classmethod
     def __torch_function__(cls, func, types, params=[], kwparams={}):
