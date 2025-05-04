@@ -13,11 +13,13 @@ class Resumer:
     # there is 1 resume state which is where the pass is.
     # it is updated in every pass after it
     # and referenced for data in every pass prior.
-    def __init__(self, path, module, name=None, sync_seconds=60*5):
-        if name is None:
-            name = module.__class__.__name__
+    def __init__(self, path, modules, name=None, sync_seconds=60*5):
+        #if name is None:
+        #    name = module.__class__.__name__
         self.resumedata = ResumeData(path, sync_seconds)
-        self.module = module
+        if type(modules) is not list:
+            modules = [modules]
+        self.modules = modules
     def _wrap_forward(self, mod, name, index):
         wrapped_forward = mod.forward
         mod.forward = lambda *params, **kwparams: self._forward(mod, name, index, wrapped_forward, params, kwparams)
@@ -33,13 +35,15 @@ class Resumer:
         return data
     def __enter__(self):
         self.resumedata.__enter__()
-        for name, mod in self.module.named_modules():
-            mod.__wrapped_forward = self._wrap_forward(mod, name, -1)
-        self.module.__wrapped_forward # ensure root module has a hook
+        for module in self.modules:
+            for name, mod in module.named_modules():
+                mod.__wrapped_forward = self._wrap_forward(mod, name, -1)
+            module.__wrapped_forward # ensure root module has a hook
     def __exit__(self, *params, **kwparams):
-        for name, mod in self.module.named_modules():
-            mod.forward = mod.__wrapped_forward
-            del mod.__wrapped_forward
+        for module in self.modules:
+            for name, mod in module.named_modules():
+                mod.forward = mod.__wrapped_forward
+                del mod.__wrapped_forward
         return self.resumedata.__exit__(*params, **kwparams)
 
 import json, os, time
